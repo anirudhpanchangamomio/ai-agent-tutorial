@@ -52,7 +52,18 @@ async def coding_agent(state: GithubAgentState):
         print(message)
         if hasattr(message, 'content'):
             final_response_from_claude = message.content
-        print(f"response from claude agent: {message}")
+        print(f"response from claude agent: {message.content}")
+    if isinstance(final_response_from_claude, list):
+        final_response_from_claude = final_response_from_claude[0]
+        if hasattr(final_response_from_claude, 'content'):
+            final_response_from_claude = final_response_from_claude.content
+        elif hasattr(final_response_from_claude, 'text'):
+            final_response_from_claude = final_response_from_claude.text
+        elif hasattr(final_response_from_claude, 'result'):
+            final_response_from_claude = final_response_from_claude.response
+        elif hasattr(final_response_from_claude, 'result'):
+            final_response_from_claude = final_response_from_claude.result
+        
     return final_response_from_claude
 
 
@@ -196,7 +207,6 @@ def make_code_changes(state: GithubAgentState) -> GithubAgentState:
     results = asyncio.get_event_loop().run_until_complete(coro)
     final_response_from_claude = results[0]
     print(f"final_response_from_claude: {final_response_from_claude}")
-    import pdb; pdb.set_trace()
     create_new_branch(state['repo'], state['pr_number'], state['comment_node_id'])
     commit_changes(state['repo'], final_response_from_claude)
     res = push_changes_and_create_pr(state['repo'], state['pr_number'], new_branch_name=f"pr-{state['pr_number']}-response-{state['comment_node_id']}", pr_title="Agent fixes for PR", pr_body="Agent fixes for PR")
@@ -207,7 +217,7 @@ def post_comment_reply(state: GithubAgentState) -> GithubAgentState:
     """Node 3: Post comment reply to GitHub"""
     # This node will handle posting replies to GitHub comments
     print(f"post_comment_reply: {state['messages'][-1].content}")
-    add_comment_to_thread(state["comment_node_id"], state["repo_analysis"].comment_reply)
+    add_comment_to_thread(state["comment_node_id"], state["comment_id"], state["repo_analysis"].comment_reply)
     return state
 
 def should_make_changes(state: GithubAgentState) -> str:

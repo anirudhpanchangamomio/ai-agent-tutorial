@@ -43,6 +43,9 @@ def main(owner, repo):
         user_message = f"""
 Please analyze the GitHub repository {owner}/{repo} and the following review comment thread:
 
+Comment Thread:
+{comments_text}
+
 PR Number: {pr_id}
 File: {comments_list[0].get('path', 'Unknown file')}
 Line: {line_number}
@@ -50,8 +53,7 @@ Line: {line_number}
 PR Diff:
 {pr_diff}
 
-Comment Thread:
-{comments_text}
+
 
 Please analyze the entire comment thread along with the PR diff to understand the code changes and determine if this requires a reply, code changes, or no action. Consider the context of all comments in the thread and how they relate to the actual code changes.
 """
@@ -63,7 +65,8 @@ Please analyze the entire comment thread along with the PR diff to understand th
                     "messages": [HumanMessage(content=user_message)],
                     "repo": repo,
                     "pr_number": pr_id,
-                    "comment_node_id": key
+                    "comment_node_id": comments_list[0]["threadId"],
+                    "comment_id": comments_list[0]["id"]
                 },
                 config={
                     "configurable": {"user_name": "Developer"},
@@ -90,12 +93,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--repo", 
         required=True, 
-        help="Repository name (e.g., 'vscode')"
+        help="Repository name (e.g., 'goeuro-connect-adapter-vexerebus')"
     )
     parser.add_argument(
         "--owner", 
         required=True, 
-        help="Repository owner (username or organization, e.g., 'microsoft')"
+        help="Repository owner (username or organization, e.g., 'goeuro')"
     )
     
     # Parse arguments

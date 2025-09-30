@@ -122,7 +122,7 @@ query($id: ID!, $cursor: String) {
 }
 """
 
-# GraphQL mutation to add a comment to a review thread
+# GraphQL mutation to add a comment to a review thread (DEPRECATED - use M_ADD_REVIEW_THREAD_REPLY instead)
 M_ADD_REVIEW_COMMENT = """
 mutation($threadId: ID!, $body: String!) {
   addPullRequestReviewComment(input: {
@@ -135,6 +135,68 @@ mutation($threadId: ID!, $body: String!) {
       url
       body
       createdAt
+    }
+  }
+}
+"""
+
+# GraphQL mutation to reply to a review thread
+M_ADD_REVIEW_THREAD_REPLY = """
+mutation($input: AddPullRequestReviewThreadReplyInput!) {
+  addPullRequestReviewThreadReply(input: $input) {
+    comment {
+      id
+      url
+      body
+      createdAt
+      author {
+        login
+      }
+    }
+  }
+}
+"""
+
+# GraphQL query to get comment details and find its parent thread
+Q_COMMENT_TO_PR = """
+query($id: ID!) {
+  node(id: $id) {
+    __typename
+    ... on PullRequestReviewComment {
+      id
+      pullRequest {
+        number
+        repository {
+          name
+          owner {
+            login
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+# GraphQL query to get review threads for a PR
+Q_REVIEW_THREADS = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 50, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          comments(first: 100) {
+            nodes {
+              id
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -318,36 +380,86 @@ def ensure_directory_exists():
     if not os.path.exists(f"/tmp/agent_repos/"):
         os.makedirs(f"/tmp/agent_repos/")
 
-def add_comment_to_thread(thread_id: str, comment_body: str) -> dict:
+def add_comment_to_thread(thread_id: str = None, comment_id: str = None, comment_body: str = None) -> dict:
     """
-    Add a comment to a specific review thread using GraphQL.
+    Reply to a PR review thread using the correct GraphQL mutation.
     
     Args:
-        thread_id: The GraphQL thread ID from build_review_comment_dict
+        thread_id: The PullRequestReviewThread node ID to reply to (preferred)
+        comment_id: A PullRequestReviewComment node ID (will find parent thread)
         comment_body: The text content of the comment to add
     
     Returns:
         Dictionary containing the result of the operation with comment details
     """
     try:
-        print(f"Adding comment to thread: {thread_id}")
+        if not comment_body:
+            raise ValueError("comment_body is required")
+        
+        if not (thread_id or comment_id):
+            raise ValueError("Provide either thread_id or comment_id")
+        
+        print(f"Adding comment to thread: {thread_id or 'from comment_id'}")
         print(f"Comment body: {comment_body}")
         
-        # Use GraphQL mutation to add the comment
-        data = _post_graphql(M_ADD_REVIEW_COMMENT, {
-            "threadId": thread_id,
-            "body": comment_body
-        })
+        # If we only have a comment_id, resolve its PR and then locate the thread containing that comment
+        if comment_id and not thread_id:
+            print(f"Looking up thread for comment_id: {comment_id}")
+            
+            # 1) Get the PR coordinates (owner/name/number) for this comment
+            node_data = _post_graphql(Q_COMMENT_TO_PR, {"id": comment_id})
+            node = node_data.get("node")
+            
+            if not node or node["__typename"] != "PullRequestReviewComment":
+                raise ValueError("comment_id is not a PullRequestReviewComment node id")
+            
+            pr = node["pullRequest"]
+            owner = pr["repository"]["owner"]["login"]
+            name = pr["repository"]["name"]
+            number = pr["number"]
+            
+            print(f"Found PR: {owner}/{name}#{number}")
+            
+            # 2) Walk the PR's reviewThreads to find which one contains this comment id
+            after = None
+            while True:
+                threads_data = _post_graphql(Q_REVIEW_THREADS, {
+                    "owner": owner,
+                    "name": name,
+                    "number": number,
+                    "after": after
+                })
+                
+                rt = threads_data["repository"]["pullRequest"]["reviewThreads"]
+                for thread in rt["nodes"]:
+                    if any(comment["id"] == comment_id for comment in thread["comments"]["nodes"]):
+                        thread_id = thread["id"]
+                        break
+                
+                if thread_id:
+                    break
+                    
+                if rt["pageInfo"]["hasNextPage"]:
+                    after = rt["pageInfo"]["endCursor"]
+                else:
+                    raise Exception("Could not locate the parent review thread for the given comment_id")
         
-        comment_data = data["addPullRequestReviewComment"]["comment"]
+        # 3) Post the reply on the thread using the correct mutation
+        payload = {
+            "pullRequestReviewThreadId": thread_id,
+            "body": comment_body
+        }
+        
+        data = _post_graphql(M_ADD_REVIEW_THREAD_REPLY, {"input": payload})
+        comment_data = data["addPullRequestReviewThreadReply"]["comment"]
         
         result = {
             "success": True,
             "comment_id": comment_data["id"],
-            "comment_database_id": comment_data["databaseId"],
             "comment_url": comment_data["url"],
             "comment_body": comment_data["body"],
             "created_at": comment_data["createdAt"],
+            "author": comment_data["author"]["login"],
             "thread_id": thread_id
         }
         
@@ -360,8 +472,24 @@ def add_comment_to_thread(thread_id: str, comment_body: str) -> dict:
         return {
             "success": False,
             "error": error_msg,
-            "thread_id": thread_id
+            "thread_id": thread_id,
+            "comment_id": comment_id
         }
+
+def reply_to_review(thread_id: str = None, comment_id: str = None, body: str = None) -> dict:
+    """
+    Convenience function that matches the GPT response interface.
+    Reply to a PR review thread.
+    
+    Args:
+        thread_id: The PullRequestReviewThread node ID to reply to (preferred)
+        comment_id: A PullRequestReviewComment node ID (will find parent thread)
+        body: The text content of the comment to add
+    
+    Returns:
+        Dictionary containing the result of the operation with comment details
+    """
+    return add_comment_to_thread(thread_id=thread_id, comment_id=comment_id, comment_body=body)
 
 def add_comment_to_comment_thread(comment_thread_data: dict, comment_body: str) -> dict:
     """
@@ -397,7 +525,7 @@ def add_comment_to_comment_thread(comment_thread_data: dict, comment_body: str) 
         print(f"Adding comment to thread for PR #{first_comment.get('pullRequestNumber', 'unknown')}")
         print(f"File: {first_comment.get('path', 'unknown')}")
         
-        return add_comment_to_thread(thread_id, comment_body)
+        return add_comment_to_thread(thread_id=thread_id, comment_body=comment_body)
         
     except Exception as e:
         error_msg = f"Error processing comment thread data: {str(e)}"

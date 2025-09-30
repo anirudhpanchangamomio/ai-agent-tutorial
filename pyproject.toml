@@ -1,0 +1,15 @@
+[project]
+name = "ai-agent-tutorial"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dotenv>=0.9.9",
+    "langchain-openai>=0.3.33",
+    "langchain>=0.3.27",
+    "langchain-core>=0.3.76",
+    "langfuse>=3.5.2",
+    "langgraph>=0.6.8",
+    "claude-agent-sdk>=0.1.0",
+]

@@ -13,3 +13,4 @@ class GithubAgentState(AgentState):
     repo_analysis: Annotated[RepoAnalysis, "The analysis of the repository"]
     pr_number: int
     comment_node_id: str
+    comment_id: str
