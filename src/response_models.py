@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Literal, TypedDict, Annotated
+from typing import Literal, Annotated
 from langgraph.prebuilt.chat_agent_executor import AgentState
 
 class RepoAnalysis(BaseModel):
@@ -10,3 +10,6 @@ class RepoAnalysis(BaseModel):
 
 class GithubAgentState(AgentState):
     repo: str
+    repo_analysis: Annotated[RepoAnalysis, "The analysis of the repository"]
+    pr_number: int
+    comment_node_id: str

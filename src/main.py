@@ -1,9 +1,9 @@
 from dotenv import load_dotenv
 load_dotenv()
-from github_utils import clone_repo, checkout_pr, build_review_comment_dict, create_new_branch, commit_changes, clear_directory, get_github_pr_diff, ensure_directory_exists
+from github_utils import clone_repo, checkout_pr, build_review_comment_dict, clear_directory, get_github_pr_diff, ensure_directory_exists
 from argparse import ArgumentParser
 import sys
-from agent import graph
+from agent import graph, langfuse_handler, langfuse
 from langchain_core.messages import HumanMessage
 
 
@@ -23,8 +23,8 @@ def main(owner, repo):
         ensure_directory_exists()
         clear_directory(repo)
         clone_repo(owner, repo)
-        result = checkout_pr(repo, pr_id)
-        print(f"checkout_pr result: {result}")
+        checkout_pr_result = checkout_pr(repo, pr_id)
+        print(f"checkout_pr result: {checkout_pr_result}")
         pr_diff = get_github_pr_diff(repo, pr_id)
         print(f"get_github_pr_diff result: {pr_diff}")
         # Create input message for the agent with all comments in the thread
@@ -61,9 +61,14 @@ Please analyze the entire comment thread along with the PR diff to understand th
             response = graph.invoke(
                 {
                     "messages": [HumanMessage(content=user_message)],
-                    "repo": repo
+                    "repo": repo,
+                    "pr_number": pr_id,
+                    "comment_node_id": key
                 },
-                config={"configurable": {"user_name": "Developer"}}
+                config={
+                    "configurable": {"user_name": "Developer"},
+                    "callbacks": [langfuse_handler]
+                }
             )
             
             print(f"Analysis for PR #{pr_id}:")
@@ -74,6 +79,9 @@ Please analyze the entire comment thread along with the PR diff to understand th
             print(f"Error processing PR #{pr_id}: {str(e)}")
             continue
         break # for now only process one comment thread
+    
+    # Flush events to Langfuse in short-lived applications
+    langfuse.flush()
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="AI Agent for GitHub review comment addresal")

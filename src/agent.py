@@ -5,10 +5,55 @@ from langgraph.prebuilt import create_react_agent
 from response_models import RepoAnalysis, GithubAgentState
 from langgraph.graph import StateGraph, START, END
 from typing import Dict, Any
-from github_tools import github_tools
+from github_utils import add_comment_to_thread, commit_changes, create_new_branch, push_changes_and_create_pr
 from langchain_core.tools import tool
 import os
 import subprocess
+
+# Langfuse imports for tracing
+from langfuse import Langfuse, get_client
+from langfuse.langchain import CallbackHandler
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions
+Langfuse()
+
+# Get the configured client instance
+langfuse = get_client()
+
+# Initialize the Langfuse handler
+langfuse_handler = CallbackHandler()
+
+async def coding_agent(state: GithubAgentState):
+    options = ClaudeAgentOptions(
+        system_prompt=f"""
+        We have been given a repository and some review comments to address.
+        An AI agent has analysed the validity of the review comment and decided that it is best to make changes as per the review comments.
+        Please go through the original review comments and make the necessary changes as per the prompt.
+        
+        Given below is the original prompt to the previous AI agent:
+        {state["messages"][0].content}
+
+        Your final message should be a commit message for the changes you have made. Make it concise and to the point.
+        """,
+        permission_mode="bypassPermissions",
+        max_turns=1000,
+        cwd=f"/tmp/agent_repos/{state['repo']}",
+        add_dirs=["/User/apanchangam/OmioCodebases/"]
+    )
+    final_response_from_claude = "Commit message from agent: "
+    async for message in query(
+        prompt=f"""
+            Reasoning: {state["repo_analysis"].reasoning}
+            Fix Prompt: {state["repo_analysis"].fix_prompt}
+            Comment Reply: {state["repo_analysis"].comment_reply}
+        """,
+        options=options
+    ):
+        print(message)
+        if hasattr(message, 'content'):
+            final_response_from_claude = message.content
+        print(f"response from claude agent: {message}")
+    return final_response_from_claude
 
 
 def prompt(state: GithubAgentState) -> list[AnyMessage]:  
@@ -34,7 +79,12 @@ You are given the following tools to use:
 use the above tools to analyze the repository and review comment.
 You will find the review comments in the user message.
 
-
+<non_negotialbles>
+Before making the decision, you must read the file that is mentioned in the review comment.
+Ensure that the comment is still relevant to the file and it is not a stale comment.
+The author of the comment can make mistakes and the comment might not be correct.
+Ensure you provide the best possible analysis of the comment. Your decision will influcence the quality of the codebase over time.
+</non_negotialbles>
 """
     return [{"role": "system", "content": system_msg}] + state["messages"]
 
@@ -121,48 +171,64 @@ def invoke_comment_analysis(state: GithubAgentState) -> GithubAgentState:
     repo_path = f"/tmp/agent_repos/{state['repo']}"
     file_tools = create_file_tools(repo_path)
     
-    # Combine GitHub tools with file tools
-    file_tools
-    
     # Create agent with all tools
     dynamic_agent = create_react_agent(
-        model="openai:gpt-4o-mini",
+        model="openai:gpt-5-mini-2025-08-07",
         tools=file_tools,
         prompt=prompt,
         response_format=RepoAnalysis
     )
     
-    return dynamic_agent.invoke(state)
+    # Invoke agent with Langfuse tracing
+    response = dynamic_agent.invoke(
+        state, 
+        config={"callbacks": [langfuse_handler]}
+    )
+    print(f"response: {response} {type(response)}")
+    response['repo_analysis'] = response['structured_response']
+    return response
 
 def make_code_changes(state: GithubAgentState) -> GithubAgentState:
     """Node 2: Make necessary code changes (placeholder)"""
     # This node is intentionally left blank as requested
     print(f"make_code_changes: {state['messages'][-1].content}")
+    coro = asyncio.gather(coding_agent(state))
+    results = asyncio.get_event_loop().run_until_complete(coro)
+    final_response_from_claude = results[0]
+    print(f"final_response_from_claude: {final_response_from_claude}")
+    import pdb; pdb.set_trace()
+    create_new_branch(state['repo'], state['pr_number'], state['comment_node_id'])
+    commit_changes(state['repo'], final_response_from_claude)
+    res = push_changes_and_create_pr(state['repo'], state['pr_number'], new_branch_name=f"pr-{state['pr_number']}-response-{state['comment_node_id']}", pr_title="Agent fixes for PR", pr_body="Agent fixes for PR")
+    print(res)
     return state
 
 def post_comment_reply(state: GithubAgentState) -> GithubAgentState:
     """Node 3: Post comment reply to GitHub"""
     # This node will handle posting replies to GitHub comments
     print(f"post_comment_reply: {state['messages'][-1].content}")
+    add_comment_to_thread(state["comment_node_id"], state["repo_analysis"].comment_reply)
     return state
 
 def should_make_changes(state: GithubAgentState) -> str:
     """Conditional edge function to determine next action"""
     # Get the last message which should contain the RepoAnalysis
     last_message = state["messages"][-1]
-    
+    print(f"last message: {last_message.content}")
+    print(f"last message type: {type(last_message.content)}")
     # Extract the structured response
-    if hasattr(last_message, 'content') and isinstance(last_message.content, RepoAnalysis):
-        analysis = last_message.content
-        if analysis.action_type == "code_change":
+    print(f"state repo_analysis: {state['repo_analysis']}")
+    if hasattr(state['repo_analysis'], 'action_type'):
+        analysis = state['repo_analysis'].action_type
+        if analysis == "code_change":
             return "make_changes"
-        elif analysis.action_type == "reply":
+        elif analysis == "reply":
             return "post_reply"
         else:
-            return "end"
+            return END
     
     # Fallback to end if we can't parse the response
-    return "end"
+    return END
 
 # Build the graph
 graph_builder = StateGraph(GithubAgentState)

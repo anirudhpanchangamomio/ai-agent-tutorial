@@ -122,6 +122,24 @@ query($id: ID!, $cursor: String) {
 }
 """
 
+# GraphQL mutation to add a comment to a review thread
+M_ADD_REVIEW_COMMENT = """
+mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewComment(input: {
+    pullRequestReviewId: $threadId
+    body: $body
+  }) {
+    comment {
+      id
+      databaseId
+      url
+      body
+      createdAt
+    }
+  }
+}
+"""
+
 # -------- Helpers -------- #
 
 def _post_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
@@ -273,17 +291,19 @@ def checkout_pr(repo: str, pr_number: int):
     os.chdir(original_cwd)
     return result.stdout
 
-def create_new_branch(repo: str, pr_number: int):
+def create_new_branch(repo: str, pr_number: int, comment_node_id: str):
     original_cwd = os.getcwd()
     os.chdir(f"/tmp/agent_repos/{repo}")
-    result = subprocess.run(f"git checkout -b pr-{pr_number}", capture_output=True, text=True)
+    result = subprocess.run(["git", "checkout", "-b", f"pr-{pr_number}-response-{comment_node_id}"], capture_output=True, text=True)
     os.chdir(original_cwd)
     return result.stdout
 
-def commit_changes(repo: str):
+def commit_changes(repo: str, commit_message: str = "update repo with changes from agent"):
     original_cwd = os.getcwd()
     os.chdir(f"/tmp/agent_repos/{repo}")
-    result = subprocess.run(["git", "commit", "-m", "update repo with changes from agent"], capture_output=True, text=True)
+    result = subprocess.run(["git", "add", "."], capture_output=True, text=True)
+    print(f"git add result: {result}")
+    result = subprocess.run(["git", "commit", "-m", commit_message], capture_output=True, text=True)
     os.chdir(original_cwd)
     return result.stdout
 
@@ -297,6 +317,232 @@ def clear_directory(repo: str):
 def ensure_directory_exists():
     if not os.path.exists(f"/tmp/agent_repos/"):
         os.makedirs(f"/tmp/agent_repos/")
+
+def add_comment_to_thread(thread_id: str, comment_body: str) -> dict:
+    """
+    Add a comment to a specific review thread using GraphQL.
+    
+    Args:
+        thread_id: The GraphQL thread ID from build_review_comment_dict
+        comment_body: The text content of the comment to add
+    
+    Returns:
+        Dictionary containing the result of the operation with comment details
+    """
+    try:
+        print(f"Adding comment to thread: {thread_id}")
+        print(f"Comment body: {comment_body}")
+        
+        # Use GraphQL mutation to add the comment
+        data = _post_graphql(M_ADD_REVIEW_COMMENT, {
+            "threadId": thread_id,
+            "body": comment_body
+        })
+        
+        comment_data = data["addPullRequestReviewComment"]["comment"]
+        
+        result = {
+            "success": True,
+            "comment_id": comment_data["id"],
+            "comment_database_id": comment_data["databaseId"],
+            "comment_url": comment_data["url"],
+            "comment_body": comment_data["body"],
+            "created_at": comment_data["createdAt"],
+            "thread_id": thread_id
+        }
+        
+        print(f"✅ Successfully added comment: {comment_data['url']}")
+        return result
+        
+    except Exception as e:
+        error_msg = f"Error adding comment to thread: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {
+            "success": False,
+            "error": error_msg,
+            "thread_id": thread_id
+        }
+
+def add_comment_to_comment_thread(comment_thread_data: dict, comment_body: str) -> dict:
+    """
+    Add a comment to a comment thread using the data structure from build_review_comment_dict.
+    
+    This is a convenience function that extracts the thread_id from the comment thread data
+    and calls add_comment_to_thread.
+    
+    Args:
+        comment_thread_data: A comment thread from build_review_comment_dict (the list of comments)
+        comment_body: The text content of the comment to add
+    
+    Returns:
+        Dictionary containing the result of the operation with comment details
+    """
+    try:
+        # Get the thread_id from the first comment in the thread
+        if not comment_thread_data or len(comment_thread_data) == 0:
+            return {
+                "success": False,
+                "error": "Empty comment thread data provided"
+            }
+        
+        first_comment = comment_thread_data[0]
+        thread_id = first_comment.get("threadId")
+        
+        if not thread_id:
+            return {
+                "success": False,
+                "error": "No threadId found in comment thread data"
+            }
+        
+        print(f"Adding comment to thread for PR #{first_comment.get('pullRequestNumber', 'unknown')}")
+        print(f"File: {first_comment.get('path', 'unknown')}")
+        
+        return add_comment_to_thread(thread_id, comment_body)
+        
+    except Exception as e:
+        error_msg = f"Error processing comment thread data: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {
+            "success": False,
+            "error": error_msg
+        }
+
+def push_changes_and_create_pr(repo: str, base_pr_number: int, new_branch_name: str = None, pr_title: str = None, pr_body: str = None) -> dict:
+    """
+    Push changes to a new branch and create a PR that targets the base PR's branch.
+    
+    This function assumes:
+    1. The repository is already checked out to a new branch
+    2. Changes have been made and committed to that branch
+    3. The new branch needs to be pushed and a PR created targeting the base PR's branch
+    
+    Args:
+        repo: Repository name (e.g., 'vscode')
+        base_pr_number: The PR number that this new PR will target
+        new_branch_name: Name for the new branch (optional, will use current branch if not provided)
+        pr_title: Title for the new PR (optional, will be auto-generated if not provided)
+        pr_body: Body/description for the new PR (optional, will be auto-generated if not provided)
+    
+    Returns:
+        Dictionary containing the result of the operation with PR URL and details
+    """
+    original_cwd = os.getcwd()
+    repo_path = f"/tmp/agent_repos/{repo}"
+    
+    try:
+        # Change to the repository directory
+        os.chdir(repo_path)
+        
+        # Get the base PR details to find the target branch
+        print(f"Getting details for base PR #{base_pr_number}")
+        pr_details_result = subprocess.run(
+            ["gh", "pr", "view", str(base_pr_number), "--json", "headRefName,baseRefName,title"],
+            capture_output=True, text=True, check=True
+        )
+        
+        pr_details = json.loads(pr_details_result.stdout)
+        base_branch = pr_details["headRefName"]  # The branch of the base PR
+        base_pr_title = pr_details["title"]
+        
+        print(f"Base PR branch: {base_branch}")
+        
+        # Get current branch name if not provided
+        if not new_branch_name:
+            current_branch_result = subprocess.run(
+                ["git", "branch", "--show-current"], 
+                capture_output=True, text=True, check=True
+            )
+            new_branch_name = current_branch_result.stdout.strip()
+        
+        print(f"Using branch: {new_branch_name}")
+        
+        # Push the current branch to remote
+        print(f"Pushing branch {new_branch_name} to remote")
+        push_result = subprocess.run(
+            ["git", "push", "-u", "origin", new_branch_name], 
+            capture_output=True, text=True, check=True
+        )
+        
+        # Generate PR title and body if not provided
+        if not pr_title:
+            pr_title = f"🤖 Agent fixes for PR #{base_pr_number}: {base_pr_title}"
+        
+        if not pr_body:
+            pr_body = f"""## 🤖 Automated Code Review Response
+
+This PR contains automated fixes and responses to comments in PR #{base_pr_number}.
+
+### Changes Made
+- Applied automated code fixes based on review comments
+- Generated responses to review feedback
+
+### Related PR
+- Base PR: #{base_pr_number}
+- Target Branch: `{base_branch}`
+
+### Generated by
+AI Agent for GitHub Code Review
+"""
+        
+        # Create the PR
+        print(f"Creating PR targeting branch: {base_branch}")
+        pr_create_result = subprocess.run([
+            "gh", "pr", "create",
+            "--base", base_branch,
+            "--head", new_branch_name,
+            "--title", pr_title,
+            "--body", pr_body
+        ], capture_output=True, text=True, check=True)
+        
+        # Extract PR URL from the output
+        pr_url = pr_create_result.stdout.strip()
+        
+        # Get the new PR number
+        pr_number_result = subprocess.run([
+            "gh", "pr", "view", pr_url, "--json", "number"
+        ], capture_output=True, text=True, check=True)
+        
+        new_pr_number = json.loads(pr_number_result.stdout)["number"]
+        
+        result = {
+            "success": True,
+            "new_pr_number": new_pr_number,
+            "new_pr_url": pr_url,
+            "new_branch_name": new_branch_name,
+            "base_pr_number": base_pr_number,
+            "base_branch": base_branch,
+            "pr_title": pr_title
+        }
+        
+        print(f"✅ Successfully created PR #{new_pr_number}: {pr_url}")
+        return result
+        
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Git/GitHub CLI error: {e.stderr}"
+        print(f"❌ Error: {error_msg}")
+        return {
+            "success": False,
+            "error": error_msg,
+            "command": e.cmd,
+            "return_code": e.returncode
+        }
+    except json.JSONDecodeError as e:
+        error_msg = f"JSON parsing error: {str(e)}"
+        print(f"❌ Error: {error_msg}")
+        return {
+            "success": False,
+            "error": error_msg
+        }
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"❌ Error: {error_msg}")
+        return {
+            "success": False,
+            "error": error_msg
+        }
+    finally:
+        # Always return to original directory
+        os.chdir(original_cwd)
 
 def main():
     ap = argparse.ArgumentParser(description="Extract review comment threads from open PRs in a repo.")
