@@ -71,6 +71,8 @@ def prompt(state: GithubAgentState) -> list[AnyMessage]:
     
     system_msg = f"""You are a GitHub code review assistant. Your task is to analyze repository code and GitHub review comments to determine the appropriate action.
 
+Policy: Prefer responding in the same natural language used by the review comment thread. If the comment is not written in a natural language or the language cannot be determined, respond in English.
+
 Given a repository and review comments, you should:
 1. Analyze the code context around the comment
 2. Understand the reviewer's feedback
