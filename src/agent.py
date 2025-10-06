@@ -52,7 +52,7 @@ async def coding_agent(state: GithubAgentState):
         print(message)
         if hasattr(message, 'content'):
             final_response_from_claude = message.content
-        print(f"response from claude agent: {message.content}")
+            print(f"response from claude agent: {message.content}")
     if isinstance(final_response_from_claude, list):
         final_response_from_claude = final_response_from_claude[0]
         if hasattr(final_response_from_claude, 'content'):
@@ -104,15 +104,17 @@ def create_file_tools(repo_path: str):
     """Create file and directory reading tools for the specific repository"""
     
     @tool
-    def read_file(file_path: str) -> str:
+    def read_file(file_path: str, start_line: int = 0, end_line: int = None) -> str:
         """
-        Read the contents of a file from the repository.
+        Read the contents of a file from the repository with optional line range.
         
         Args:
             file_path: Path to the file relative to the repository root
+            start_line: Starting line number (0-indexed, default: 0)
+            end_line: Ending line number (0-indexed, default: None for entire file)
         
         Returns:
-            String containing the file contents
+            String containing the file contents with line numbers prepended
         """
         try:
             full_path = os.path.join(repo_path, file_path)
@@ -120,7 +122,35 @@ def create_file_tools(repo_path: str):
                 return f"File not found: {file_path}"
             
             with open(full_path, 'r', encoding='utf-8') as f:
-                return f.read()
+                lines = f.readlines()
+            
+            # Handle empty file case
+            if len(lines) == 0:
+                return ""
+            
+            # Handle line range with proper bounds checking
+            if end_line is None:
+                end_line = len(lines) - 1
+            else:
+                end_line = min(end_line, len(lines) - 1)
+            
+            # Ensure start_line is within bounds
+            start_line = max(0, start_line)
+            
+            # Ensure start_line doesn't exceed end_line
+            if start_line > end_line:
+                return ""
+            
+            # Extract the requested lines
+            selected_lines = lines[start_line:end_line + 1]
+            
+            # Add line numbers to each line
+            result = ""
+            for i, line in enumerate(selected_lines):
+                line_number = start_line + i
+                result += f"{line_number}->{line}"
+            
+            return result
         except Exception as e:
             return f"Error reading file {file_path}: {str(e)}"
     
