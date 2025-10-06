@@ -26,10 +26,12 @@ langfuse_handler = CallbackHandler()
 async def coding_agent(state: GithubAgentState):
     options = ClaudeAgentOptions(
         system_prompt=f"""
+        Please respond in English unless another language is explicitly requested.
+
         We have been given a repository and some review comments to address.
         An AI agent has analysed the validity of the review comment and decided that it is best to make changes as per the review comments.
         Please go through the original review comments and make the necessary changes as per the prompt.
-        
+
         Given below is the original prompt to the previous AI agent:
         {state["messages"][0].content}
 
@@ -69,7 +71,7 @@ async def coding_agent(state: GithubAgentState):
 
 def prompt(state: GithubAgentState) -> list[AnyMessage]:  
     
-    system_msg = f"""You are a GitHub code review assistant. Your task is to analyze repository code and GitHub review comments to determine the appropriate action.
+    system_msg = f"""You are a GitHub code review assistant. Please respond in English unless the user explicitly requests another language. Your task is to analyze repository code and GitHub review comments to determine the appropriate action.
 
 Given a repository and review comments, you should:
 1. Analyze the code context around the comment
