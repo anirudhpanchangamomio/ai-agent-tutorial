@@ -12,4 +12,6 @@ dependencies = [
     "langfuse>=3.5.2",
     "langgraph>=0.6.8",
     "claude-agent-sdk>=0.1.0",
+    "aider-chat>=0.35.0",
+    "aider-install",
 ]

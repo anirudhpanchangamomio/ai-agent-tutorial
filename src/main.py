@@ -57,8 +57,6 @@ PR Diff:
 
 Please analyze the entire comment thread along with the PR diff to understand the code changes and determine if this requires a reply, code changes, or no action. Consider the context of all comments in the thread and how they relate to the actual code changes.
 """
-        
-        # Invoke the LangGraph agent
         try:
             response = graph.invoke(
                 {
@@ -66,7 +64,8 @@ Please analyze the entire comment thread along with the PR diff to understand th
                     "repo": repo,
                     "pr_number": pr_id,
                     "comment_node_id": comments_list[0]["threadId"],
-                    "comment_id": comments_list[0]["id"]
+                    "comment_id": comments_list[0]["id"],
+                    "main_agent_trace_id": langfuse.get_current_trace_id()
                 },
                 config={
                     "configurable": {"user_name": "Developer"},

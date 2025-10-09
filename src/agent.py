@@ -6,15 +6,24 @@ from response_models import RepoAnalysis, GithubAgentState
 from langgraph.graph import StateGraph, START, END
 from typing import Dict, Any
 from github_utils import add_comment_to_thread, commit_changes, create_new_branch, push_changes_and_create_pr
-from langchain_core.tools import tool
+from github_tools import github_tools
+from tools import create_file_tools
+from sub_agents import create_traced_subagent_tool
+from coding_agent import CodingAgent
 import os
 import subprocess
+import asyncio
+from claude_agent_sdk import ClaudeAgentOptions, query
 
 # Langfuse imports for tracing
 from langfuse import Langfuse, get_client
 from langfuse.langchain import CallbackHandler
-import asyncio
-from claude_agent_sdk import query, ClaudeAgentOptions
+
+# Initialize Langfuse client (uses environment variables)
+# Set these environment variables:
+# LANGFUSE_PUBLIC_KEY="your-public-key"
+# LANGFUSE_SECRET_KEY="your-secret-key"
+# LANGFUSE_HOST="https://cloud.langfuse.com"  # Optional: defaults to https://cloud.langfuse.com
 Langfuse()
 
 # Get the configured client instance
@@ -23,48 +32,6 @@ langfuse = get_client()
 # Initialize the Langfuse handler
 langfuse_handler = CallbackHandler()
 
-async def coding_agent(state: GithubAgentState):
-    options = ClaudeAgentOptions(
-        system_prompt=f"""
-        We have been given a repository and some review comments to address.
-        An AI agent has analysed the validity of the review comment and decided that it is best to make changes as per the review comments.
-        Please go through the original review comments and make the necessary changes as per the prompt.
-        
-        Given below is the original prompt to the previous AI agent:
-        {state["messages"][0].content}
-
-        Your final message should be a commit message for the changes you have made. Make it concise and to the point.
-        """,
-        permission_mode="bypassPermissions",
-        max_turns=1000,
-        cwd=f"/tmp/agent_repos/{state['repo']}",
-        add_dirs=["/User/apanchangam/OmioCodebases/"]
-    )
-    final_response_from_claude = "Commit message from agent: "
-    async for message in query(
-        prompt=f"""
-            Reasoning: {state["repo_analysis"].reasoning}
-            Fix Prompt: {state["repo_analysis"].fix_prompt}
-            Comment Reply: {state["repo_analysis"].comment_reply}
-        """,
-        options=options
-    ):
-        print(message)
-        if hasattr(message, 'content'):
-            final_response_from_claude = message.content
-            print(f"response from claude agent: {message.content}")
-    if isinstance(final_response_from_claude, list):
-        final_response_from_claude = final_response_from_claude[0]
-        if hasattr(final_response_from_claude, 'content'):
-            final_response_from_claude = final_response_from_claude.content
-        elif hasattr(final_response_from_claude, 'text'):
-            final_response_from_claude = final_response_from_claude.text
-        elif hasattr(final_response_from_claude, 'result'):
-            final_response_from_claude = final_response_from_claude.response
-        elif hasattr(final_response_from_claude, 'result'):
-            final_response_from_claude = final_response_from_claude.result
-        
-    return final_response_from_claude
 
 
 def prompt(state: GithubAgentState) -> list[AnyMessage]:  
@@ -86,8 +53,10 @@ Respond with a structured analysis including:
 You are given the following tools to use:
 - read_file: Read the contents of a file from the repository
 - read_directory: Read the directory structure of the repository
+- grep: Search the repository for a specific string
+- sub_agent: Analyze a code repository that is not the one that is being reviewed
 
-use the above tools to analyze the repository and review comment.
+Use the above tools to analyze the repository and review comment.
 You will find the review comments in the user message.
 
 <non_negotialbles>
@@ -100,155 +69,166 @@ Ensure you provide the best possible analysis of the comment. Your decision will
     return [{"role": "system", "content": system_msg}] + state["messages"]
 
 
-def create_file_tools(repo_path: str):
-    """Create file and directory reading tools for the specific repository"""
-    
-    @tool
-    def read_file(file_path: str, start_line: int = 0, end_line: int = None) -> str:
-        """
-        Read the contents of a file from the repository with optional line range.
-        
-        Args:
-            file_path: Path to the file relative to the repository root
-            start_line: Starting line number (0-indexed, default: 0)
-            end_line: Ending line number (0-indexed, default: None for entire file)
-        
-        Returns:
-            String containing the file contents with line numbers prepended
-        """
-        try:
-            full_path = os.path.join(repo_path, file_path)
-            if not os.path.exists(full_path):
-                return f"File not found: {file_path}"
-            
-            with open(full_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            
-            # Handle empty file case
-            if len(lines) == 0:
-                return ""
-            
-            # Handle line range with proper bounds checking
-            if end_line is None:
-                end_line = len(lines) - 1
-            else:
-                end_line = min(end_line, len(lines) - 1)
-            
-            # Ensure start_line is within bounds
-            start_line = max(0, start_line)
-            
-            # Ensure start_line doesn't exceed end_line
-            if start_line > end_line:
-                return ""
-            
-            # Extract the requested lines
-            selected_lines = lines[start_line:end_line + 1]
-            
-            # Add line numbers to each line
-            result = ""
-            for i, line in enumerate(selected_lines):
-                line_number = start_line + i
-                result += f"{line_number}->{line}"
-            
-            return result
-        except Exception as e:
-            return f"Error reading file {file_path}: {str(e)}"
-    
-    @tool
-    def read_directory() -> str:
-        """
-        Display the directory structure using tree command, including hidden files.
-        
-        Args:
-            directory_path: Path to the directory relative to the repository root (default: ".")
-        
-        Returns:
-            String containing the tree structure of the directory
-        """
-        try:
-            directory_path = "."
-            full_path = os.path.join(repo_path, directory_path)
-            if not os.path.exists(full_path):
-                return f"Directory not found: {directory_path}"
-            
-            if not os.path.isdir(full_path):
-                return f"Path is not a directory: {directory_path}"
-            
-            # Run tree command with -a flag to show hidden files
-            result = subprocess.run(
-                ["tree", "-a", directory_path], 
-                cwd=repo_path,
-                capture_output=True, 
-                text=True, 
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                return f"Directory structure for {directory_path}:\n{result.stdout}"
-            else:
-                # Fallback to ls if tree is not available
-                ls_result = subprocess.run(
-                    ["ls", "-la", directory_path], 
-                    cwd=repo_path,
-                    capture_output=True, 
-                    text=True, 
-                    timeout=10
-                )
-                if ls_result.returncode == 0:
-                    return f"Directory listing for {directory_path}:\n{ls_result.stdout}"
-                else:
-                    return f"Error running tree/ls command: {result.stderr or ls_result.stderr}"
-                    
-        except subprocess.TimeoutExpired:
-            return f"Timeout while reading directory {directory_path}"
-        except Exception as e:
-            return f"Error reading directory {directory_path}: {str(e)}"
-    
-    return [read_file, read_directory]
-
 def invoke_comment_analysis(state: GithubAgentState) -> GithubAgentState:
     """Node 1: React agent analyzes the repository and comments"""
-    # Create file tools for the specific repository
-    repo_path = f"/tmp/agent_repos/{state['repo']}"
-    file_tools = create_file_tools(repo_path)
-    
-    # Create agent with all tools
-    dynamic_agent = create_react_agent(
-        model="openai:gpt-5-mini-2025-08-07",
-        tools=file_tools,
-        prompt=prompt,
-        response_format=RepoAnalysis
-    )
-    
-    # Invoke agent with Langfuse tracing
-    response = dynamic_agent.invoke(
-        state, 
-        config={"callbacks": [langfuse_handler]}
-    )
-    print(f"response: {response} {type(response)}")
-    response['repo_analysis'] = response['structured_response']
-    return response
+    # Create a main agent trace
+    with langfuse.start_as_current_span(
+        name=f"comment-analysis-{state['repo']}-{state['pr_number']}",
+        metadata={
+            "agent_type": "comment_analysis",
+            "repository": state['repo'],
+            "pr_number": state.get('pr_number'),
+            "comment_id": state.get('comment_id'),
+            "main_agent_trace_id": state.get('main_agent_trace_id')
+        }
+    ) as main_span:
+        # Get the current trace ID to pass to subagents
+        current_trace_id = main_span.trace_id
+        
+        # Create file tools for the specific repository
+        repo_path = f"/tmp/agent_repos/{state['repo']}"
+        file_tools = create_file_tools(repo_path)
+        sub_agent = create_traced_subagent_tool(current_trace_id)
+        
+        # Combine file tools with the traced subagent tool
+        all_tools = file_tools + [sub_agent]
+        
+        # Create agent with all tools
+        dynamic_agent = create_react_agent(
+            model="openai:gpt-5-mini-2025-08-07",
+            tools=all_tools,
+            prompt=prompt,
+            response_format=RepoAnalysis
+        )
+        
+        # Update main span with input
+        main_span.update_trace(
+            input={
+                "repository": state['repo'],
+                "messages": [msg.content for msg in state['messages']],
+                "trace_id": current_trace_id
+            }
+        )
+        
+        # Invoke agent with Langfuse tracing
+        response = dynamic_agent.invoke(
+            state, 
+            config={
+                "callbacks": [langfuse_handler],
+                "metadata": {
+                    "langfuse_user_id": f"main_agent_{state['repo']}",
+                    "main_trace_id": current_trace_id
+                }
+            }
+        )
+        
+        print(f"response: {response} {type(response)}")
+        response['repo_analysis'] = response['structured_response']
+        
+        # Update main span with output
+        main_span.update_trace(
+            output={
+                "analysis_result": response['repo_analysis'],
+                "trace_id": current_trace_id
+            }
+        )
+        
+        # Store the trace ID in the state for subagents to use
+        response['main_agent_trace_id'] = current_trace_id
+        
+        return response
 
 def make_code_changes(state: GithubAgentState) -> GithubAgentState:
     """Node 2: Make necessary code changes (placeholder)"""
-    # This node is intentionally left blank as requested
-    print(f"make_code_changes: {state['messages'][-1].content}")
-    coro = asyncio.gather(coding_agent(state))
-    results = asyncio.get_event_loop().run_until_complete(coro)
-    final_response_from_claude = results[0]
-    print(f"final_response_from_claude: {final_response_from_claude}")
-    create_new_branch(state['repo'], state['pr_number'], state['comment_node_id'])
-    commit_changes(state['repo'], final_response_from_claude)
-    res = push_changes_and_create_pr(state['repo'], state['pr_number'], new_branch_name=f"pr-{state['pr_number']}-response-{state['comment_node_id']}", pr_title="Agent fixes for PR", pr_body="Agent fixes for PR")
-    print(res)
-    return state
+    # Create a trace for code changes
+    with langfuse.start_as_current_span(
+        name=f"code-changes-{state['repo']}-{state['pr_number']}",
+        trace_id=state.get('main_agent_trace_id'),  # Link to main agent trace
+        metadata={
+            "agent_type": "main_agent",
+            "action": "code_changes",
+            "repository": state['repo'],
+            "pr_number": state.get('pr_number'),
+            "comment_id": state.get('comment_id')
+        }
+    ) as code_span:
+        print(f"make_code_changes: {state['messages'][-1].content}")
+        
+        # Update span with input
+        code_span.update_trace(
+            input={
+                "repository": state['repo'],
+                "pr_number": state.get('pr_number'),
+                "comment_node_id": state.get('comment_node_id'),
+                "main_trace_id": state.get('main_agent_trace_id')
+            }
+        )
+        
+        # Initialize coding agent (can use either "claude" or "aider" backend)
+        coding_agent = CodingAgent(backend="claude", additional_dirs=["/User/apanchangam/OmioCodebases/"])
+        
+        # Execute code changes
+        coro = asyncio.gather(coding_agent.execute_code_changes(state))
+        results = asyncio.get_event_loop().run_until_complete(coro)
+        final_response_from_claude = results[0]
+        print(f"final_response_from_claude: {final_response_from_claude}")
+        
+        create_new_branch(state['repo'], state['pr_number'], state['comment_node_id'])
+        commit_changes(state['repo'], final_response_from_claude)
+        res = push_changes_and_create_pr(state['repo'], state['pr_number'], new_branch_name=f"pr-{state['pr_number']}-response-{state['comment_node_id']}", pr_title="Agent fixes for PR", pr_body="Agent fixes for PR")
+        if state['repo_analysis'].comment_reply is not None:
+            add_comment_to_thread(state['comment_node_id'], state['comment_id'], state['repo_analysis'].comment_reply)
+        print(res)
+        
+        # Update span with output
+        code_span.update_trace(
+            output={
+                "commit_message": final_response_from_claude,
+                "pr_created": res,
+                "branch_name": f"pr-{state['pr_number']}-response-{state['comment_node_id']}"
+            }
+        )
+        
+        return state
 
 def post_comment_reply(state: GithubAgentState) -> GithubAgentState:
     """Node 3: Post comment reply to GitHub"""
-    # This node will handle posting replies to GitHub comments
-    print(f"post_comment_reply: {state['messages'][-1].content}")
-    add_comment_to_thread(state["comment_node_id"], state["comment_id"], state["repo_analysis"].comment_reply)
-    return state
+    # Create a trace for comment reply
+    with langfuse.start_as_current_span(
+        name="main_agent_comment_reply",
+        trace_id=state.get('main_agent_trace_id'),  # Link to main agent trace
+        metadata={
+            "agent_type": "main_agent",
+            "action": "comment_reply",
+            "repository": state['repo'],
+            "pr_number": state.get('pr_number'),
+            "comment_id": state.get('comment_id')
+        }
+    ) as reply_span:
+        print(f"post_comment_reply: {state['messages'][-1].content}")
+        
+        # Update span with input
+        reply_span.update_trace(
+            input={
+                "repository": state['repo'],
+                "comment_node_id": state.get('comment_node_id'),
+                "comment_id": state.get('comment_id'),
+                "reply_text": state["repo_analysis"].comment_reply,
+                "main_trace_id": state.get('main_agent_trace_id')
+            }
+        )
+        
+        add_comment_to_thread(state["comment_node_id"], state["comment_id"], state["repo_analysis"].comment_reply)
+        
+        # Update span with output
+        reply_span.update_trace(
+            output={
+                "comment_posted": True,
+                "reply_text": state["repo_analysis"].comment_reply
+            }
+        )
+        
+        return state
 
 def should_make_changes(state: GithubAgentState) -> str:
     """Conditional edge function to determine next action"""

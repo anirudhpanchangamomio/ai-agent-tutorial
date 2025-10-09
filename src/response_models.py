@@ -14,3 +14,4 @@ class GithubAgentState(AgentState):
     pr_number: int
     comment_node_id: str
     comment_id: str
+    main_agent_trace_id: str
